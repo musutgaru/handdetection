@@ -1,0 +1,199 @@
+# 50class 10 augmentation
+
+import os
+import cv2
+import shutil
+import numpy as np
+import pandas as pd
+import h5py
+import random
+import mediapipe as mp
+from tensorflow.keras.utils import to_categorical
+
+# --- Parameters ---
+param = {
+    'video_dir':      os.path.expanduser('~/Desktop/jeongeun/DL/수어 데이터셋'),
+    'excel_path':     os.path.expanduser('~/Desktop/jeongeun/DL/수어 데이터셋/KETI-2017-SL-Annotation-v2_1.xlsx'),
+    'out_dir':        os.path.expanduser('~/Desktop/jeongeun/DL/keypoints_h5'),
+    'out_h5':         'keypoints_3d_50class_10aug.h5',
+    'time_steps':     30,    # frames per sequence
+    'augment_factor': 10,    # augmentation per video
+    'rnd_seed':       42,
+    'height':         224,
+    'width':          224,
+}
+# Ensure reproducibility
+random.seed(param['rnd_seed'])
+np.random.seed(param['rnd_seed'])
+
+# --- Augmentation Utilities ---
+def rotate_keypoints(seq, angle_deg):
+    theta = np.deg2rad(angle_deg)
+    R = np.array([[np.cos(theta), -np.sin(theta)],
+                  [np.sin(theta),  np.cos(theta)]], dtype=np.float32)
+    out = seq.copy()
+    idx_xy = [(i, i+1) for i in range(0, seq.shape[1], 3)]
+    center = np.array([0.5, 0.5], dtype=np.float32)
+    for t in range(out.shape[0]):
+        pts = np.stack([out[t, i:i+2] for i,j in idx_xy])
+        pts = (pts - center) @ R.T + center
+        for k,(i,j) in enumerate(idx_xy):
+            out[t,i], out[t,j] = pts[k]
+    return out
+
+
+def scale_keypoints(seq, s):
+    out = seq.copy()
+    for (i,j) in [(i,i+1) for i in range(0, seq.shape[1], 3)]:
+        out[:,i] = (out[:,i]-0.5)*s + 0.5
+        out[:,j] = (out[:,j]-0.5)*s + 0.5
+    return out
+
+
+def translate_keypoints(seq, tx, ty):
+    out = seq.copy()
+    for (i,j) in [(i,i+1) for i in range(0, seq.shape[1], 3)]:
+        out[:,i] += tx
+        out[:,j] += ty
+    return out
+
+
+def augment_keypoints(seq):
+    ang = np.random.uniform(-30,30)
+    s   = np.random.uniform(0.8,1.2)
+    tx  = np.random.uniform(-0.05,0.05)
+    ty  = np.random.uniform(-0.05,0.05)
+    out = rotate_keypoints(seq, ang)
+    out = scale_keypoints(out, s)
+    out = translate_keypoints(out, tx, ty)
+    return out
+
+
+# --- Main Extraction Function ---
+def extract_and_save_h5(param):
+    # Prepare output directory
+    out_dir = param['out_dir']
+    if os.path.exists(out_dir):
+        shutil.rmtree(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Load metadata and select 50 classes
+    meta = pd.read_excel(param['excel_path'], engine='openpyxl')
+    meta['한국어'] = meta['한국어'].str.strip()
+    all_classes = meta['한국어'].unique().tolist()
+    random.shuffle(all_classes)
+    selected_classes = all_classes[:50]
+    print("Selected 50 classes:", selected_classes)
+    class2idx = {c:i for i,c in enumerate(selected_classes)}
+    num_classes = len(selected_classes)
+
+    # Initialize MediaPipe
+    mp_pose  = mp.solutions.pose.Pose(min_detection_confidence=0.5,
+                                      min_tracking_confidence=0.5)
+    mp_hands = mp.solutions.hands.Hands(min_detection_confidence=0.5,
+                                        min_tracking_confidence=0.5,
+                                        max_num_hands=2)
+
+    all_X = []  # list of (time_steps, feat_dim)
+    all_y = []  # list of int labels
+
+    # Iterate through selected videos
+    for _, row in meta.iterrows():
+        label = row['한국어']
+        if label not in class2idx:
+            continue
+        vid_name = os.path.splitext(row['파일명'])[0]
+        lbl_idx = class2idx[label]
+
+        # Find video file
+        path = None
+        for ext in ('.MP4','.MOV','.AVI','.MTS'):
+            cand = os.path.join(param['video_dir'], vid_name+ext)
+            if os.path.isfile(cand):
+                path = cand; break
+        if path is None:
+            print(f"[Warning] Video not found: {vid_name}")
+            continue
+
+        # Read frames
+        cap = cv2.VideoCapture(path)
+        frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret: break
+            frames.append(frame)
+        cap.release()
+        M = len(frames)
+        if M == 0:
+            print(f"[Warning] No frames in video: {vid_name}")
+            continue
+
+        # Augmentation loop
+        for k in range(param['augment_factor']):
+            if k == 0:
+                idxs = np.linspace(0, M-1, param['time_steps'], dtype=int)
+            else:
+                idxs = np.random.choice(M, param['time_steps'], replace=True)
+
+            seq = []
+            for i in idxs:
+                img = cv2.resize(frames[i], (param['width'], param['height']))
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                p_res = mp_pose.process(rgb)
+                h_res = mp_hands.process(rgb)
+
+                coords = []
+                # Pose landmarks (shoulders)
+                if p_res.pose_landmarks:
+                    for j in (11,13,12,14):
+                        lm = p_res.pose_landmarks.landmark[j]
+                        coords += [lm.x, lm.y, lm.z]
+                else:
+                    coords += [0.0]*12
+                # Hand landmarks
+                hands = (h_res.multi_hand_landmarks or [])[:2]
+                for hand in hands:
+                    for lm in hand.landmark:
+                        coords += [lm.x, lm.y, lm.z]
+                # Fill missing hands
+                if len(hands) == 0:
+                    coords += [0.0]*126
+                elif len(hands) == 1:
+                    coords += [0.0]*63
+
+                # Normalize by shoulder center
+                cx = (coords[0] + coords[6]) * 0.5
+                cy = (coords[1] + coords[7]) * 0.5
+                sc = np.hypot(coords[6]-coords[0], coords[7]-coords[1]) + 1e-6
+                for t in range(0, len(coords), 3):
+                    coords[t]   = (coords[t]   - cx) / sc
+                    coords[t+1] = (coords[t+1] - cy) / sc
+
+                seq.append(coords)
+
+            arr = np.array(seq, dtype=np.float32)  # (time_steps, feat_dim)
+            if k > 0:
+                arr = augment_keypoints(arr)
+
+            all_X.append(arr)
+            all_y.append(lbl_idx)
+            print(f"[{label}/{vid_name}] augmentation {k} done")
+
+    # Stack arrays and convert labels
+    X = np.stack(all_X, axis=0)       # (N, time_steps, feat_dim)
+    y_idx = np.array(all_y, dtype=np.int32)
+    y_onehot = to_categorical(y_idx, num_classes)
+
+    # Save to H5
+    h5_path = os.path.join(out_dir, param['out_h5'])
+    with h5py.File(h5_path, 'w') as f:
+        f.create_dataset('X', data=X, compression='gzip')
+        f.create_dataset('y_idx', data=y_idx, compression='gzip')
+        f.create_dataset('y_onehot', data=y_onehot, compression='gzip')
+        dt = h5py.string_dtype(encoding='utf-8')
+        f.create_dataset('classes', data=np.array(selected_classes, dtype=object), dtype=dt)
+    print(f"H5 file saved: {h5_path} (X:{X.shape}, y:{y_onehot.shape})")
+
+
+if __name__ == '__main__':
+    extract_and_save_h5(param)
